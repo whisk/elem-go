@@ -1,8 +1,13 @@
 package elem
 
 import (
-	"github.com/stretchr/testify/assert"
+	"fmt"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"golang.org/x/net/html"
+	"pgregory.net/rapid"
 )
 
 // MockStyleManager simulates the StyleManager for testing purposes.
@@ -37,4 +42,22 @@ func TestRenderWithOptionsInjectsCSSIntoHead(t *testing.T) {
 
 	// Use testify's assert.Equal to check if the HTML output matches the expected HTML
 	assert.Equal(t, expectedHTML, htmlOutput, "The generated HTML should include the CSS in the <head> section")
+}
+
+func TestRenderRapid(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		attrsGen := rapid.MapOfN(rapid.String(), rapid.String(), 0, 4)
+		bodyGen := rapid.StringOf(rapid.Rune())
+		for i := 0; i < 10; i++ {
+
+			str := Div(attrsGen.Draw(t, "a"), Comment(bodyGen.Draw(t, "t"))).Render()
+			fmt.Println(str)
+
+			doc, err := html.Parse(strings.NewReader(str))
+			fmt.Println(doc)
+			if err != nil {
+				t.Logf("invalid html: %s", err)
+			}
+		}
+	})
 }
