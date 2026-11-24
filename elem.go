@@ -59,10 +59,42 @@ type CSSGenerator interface {
 	GenerateCSS() string // TODO: Change to CSS()
 }
 
+// InvalidNameMode controls how Element rendering handles invalid HTML tag or attribute names.
+type InvalidNameMode int
+
+const (
+	// InvalidNamePlaceholder renders an HTML comment (<!-- empty tag --> or
+	// <!-- invalid tag: ... --> with invalid characters replaced by '_') in place
+	// of elements with invalid tag names, and replaces invalid attribute names
+	// with valueless data-invalid-attr (for empty names) or
+	// data-invalid-attr-... attributes (with characters outside [a-zA-Z0-9-_]
+	// replaced by '_').
+	// This is the default (zero value) so invalid names are never silently dropped.
+	InvalidNamePlaceholder InvalidNameMode = iota
+	// InvalidNamePanic panics when encountering an invalid tag or attribute name.
+	InvalidNamePanic
+	// InvalidNameAsIs renders invalid tag and attribute names verbatim without
+	// validation, preserving pre-validation behavior for backwards compatibility.
+	//
+	// Deprecated: InvalidNameAsIs is unsafe (it permits HTML and attribute
+	// injection if names are not strictly trusted), is not recommended for use,
+	// and may be removed in a future version. Use InvalidNamePlaceholder or
+	// InvalidNamePanic instead.
+	InvalidNameAsIs
+)
+
+const invalidAttrPlaceholder = "data-invalid-attr"
+
 type RenderOptions struct {
 	// DisableHtmlPreamble disables the doctype preamble for the HTML tag if it exists in the rendering tree
 	DisableHtmlPreamble bool
 	StyleManager        CSSGenerator
+	// InvalidTagMode controls how invalid HTML tag names are handled.
+	// The zero value (InvalidNamePlaceholder) renders an HTML comment placeholder.
+	InvalidTagMode InvalidNameMode
+	// InvalidAttrMode controls how invalid HTML attribute names are handled.
+	// The zero value (InvalidNamePlaceholder) emits valueless data-invalid-attr-... placeholder attributes.
+	InvalidAttrMode InvalidNameMode
 }
 
 type Node interface {
@@ -128,7 +160,7 @@ func NewScriptNode(node Node) ScriptNode {
 }
 
 func (t ScriptNode) RenderTo(builder *strings.Builder, opts RenderOptions) {
-	scriptContents := EscapeScriptContents(t.node.Render())
+	scriptContents := EscapeScriptContents(t.node.RenderWithOptions(opts))
 	builder.WriteString(scriptContents)
 }
 
@@ -184,7 +216,32 @@ type Element struct {
 	Children []Node
 }
 
+// RenderTo writes the HTML representation of e into builder.
+// By default (InvalidNamePlaceholder), invalid tag or attribute names are
+// replaced with safe placeholders; set RenderOptions.InvalidTagMode or
+// RenderOptions.InvalidAttrMode to InvalidNamePanic to panic instead.
 func (e *Element) RenderTo(builder *strings.Builder, opts RenderOptions) {
+	if e.Tag == "fragment" {
+		for _, child := range e.Children {
+			child.RenderTo(builder, opts)
+		}
+		return
+	}
+
+	if opts.InvalidTagMode != InvalidNameAsIs && !validTagName(e.Tag) {
+		if opts.InvalidTagMode == InvalidNamePanic {
+			panic(fmt.Sprintf("invalid tag name %q", e.Tag))
+		}
+		if e.Tag == "" {
+			builder.WriteString("<!-- empty tag -->")
+		} else {
+			builder.WriteString("<!-- invalid tag: ")
+			writeSanitizedName(builder, e.Tag)
+			builder.WriteString(" -->")
+		}
+		return
+	}
+
 	// The HTML tag needs a doctype preamble in order to ensure
 	// browsers don't render in legacy/quirks mode
 	// https://developer.mozilla.org/en-US/docs/Glossary/Doctype
@@ -192,13 +249,9 @@ func (e *Element) RenderTo(builder *strings.Builder, opts RenderOptions) {
 		builder.WriteString("<!DOCTYPE html>")
 	}
 
-	isFragment := e.Tag == "fragment"
-
 	// Start with opening tag
-	if !isFragment {
-		builder.WriteString("<")
-		builder.WriteString(e.Tag)
-	}
+	builder.WriteString("<")
+	builder.WriteString(e.Tag)
 
 	// Append the attributes to the builder in sorted order for consistent
 	// output. Elements with zero or one attribute skip the sort entirely.
@@ -206,7 +259,10 @@ func (e *Element) RenderTo(builder *strings.Builder, opts RenderOptions) {
 	case 0:
 	case 1:
 		for k, v := range e.Attrs {
-			renderAttrTo(k, v, builder)
+			if !renderAttrTo(k, v, builder, opts.InvalidAttrMode) {
+				builder.WriteByte(' ')
+				writeInvalidAttrPlaceholder(builder, k)
+			}
 		}
 	default:
 		// Use a stack-allocated array for typical attribute counts so
@@ -222,8 +278,27 @@ func (e *Element) RenderTo(builder *strings.Builder, opts RenderOptions) {
 			keys = append(keys, k)
 		}
 		slices.Sort(keys)
+		var invalidAttrs []string
 		for _, k := range keys {
-			renderAttrTo(k, e.Attrs[k], builder)
+			if !renderAttrTo(k, e.Attrs[k], builder, opts.InvalidAttrMode) {
+				invalidAttrs = append(invalidAttrs, invalidAttrName(k))
+			}
+		}
+		if len(invalidAttrs) > 0 {
+			if len(invalidAttrs) > 1 {
+				slices.Sort(invalidAttrs)
+			}
+			var prev string
+			for i, placeholder := range invalidAttrs {
+				if i > 0 && placeholder == prev {
+					continue
+				}
+				prev = placeholder
+				if _, exists := e.Attrs[placeholder]; !exists {
+					builder.WriteByte(' ')
+					builder.WriteString(placeholder)
+				}
+			}
 		}
 	}
 
@@ -233,26 +308,29 @@ func (e *Element) RenderTo(builder *strings.Builder, opts RenderOptions) {
 		return
 	}
 
-	if !isFragment {
-		// Close opening tag
-		builder.WriteString(`>`)
-	}
+	// Close opening tag
+	builder.WriteString(`>`)
 
 	// Build the content
 	for _, child := range e.Children {
 		child.RenderTo(builder, opts)
 	}
 
-	if !isFragment {
-		// Append closing tag
-		builder.WriteString(`</`)
-		builder.WriteString(e.Tag)
-		builder.WriteString(`>`)
-	}
+	// Append closing tag
+	builder.WriteString(`</`)
+	builder.WriteString(e.Tag)
+	builder.WriteString(`>`)
 }
 
-// return string representation of given attribute with its value
-func renderAttrTo(attrName, attrVal string, builder *strings.Builder) {
+// renderAttrTo writes the string representation of the given attribute and value
+// to builder, returning false if attrName was invalid and replaced by a placeholder.
+func renderAttrTo(attrName, attrVal string, builder *strings.Builder, mode InvalidNameMode) bool {
+	if mode != InvalidNameAsIs && !validAttrName(attrName) {
+		if mode == InvalidNamePanic {
+			panic(fmt.Sprintf("invalid attribute name %q", attrName))
+		}
+		return false
+	}
 	if _, exists := booleanAttrs[attrName]; exists {
 		// boolean attribute presents its name only if the value is "true"
 		if attrVal == "true" {
@@ -277,6 +355,7 @@ func renderAttrTo(attrName, attrVal string, builder *strings.Builder) {
 			builder.WriteString(`"`)
 		}
 	}
+	return true
 }
 
 func (e *Element) Render() string {
@@ -307,7 +386,7 @@ func (e *Element) RenderWithOptions(opts RenderOptions) string {
 	builder.Grow(e.estimateSize())
 	e.RenderTo(&builder, opts)
 
-	if opts.StyleManager != nil {
+	if opts.StyleManager != nil && (e.Tag == "fragment" || opts.InvalidTagMode == InvalidNameAsIs || validTagName(e.Tag)) {
 		htmlContent := builder.String()
 		cssContent := opts.StyleManager.GenerateCSS()
 

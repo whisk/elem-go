@@ -965,6 +965,209 @@ func TestAttributeValueTagsEscape(t *testing.T) {
 	assert.Equal(t, expected, el.Render())
 }
 
+func TestInvalidAttrNamePlaceholder(t *testing.T) {
+	el := Div(attrs.Props{
+		attrs.ID:                       "safe",
+		"":                             "empty",
+		"onclick=alert(1) x":           "space",
+		attrs.DataAttr(`x"><script>`):  "tag-breakout",
+		attrs.DataAttr("x/onload=foo"): "slash",
+		"data-\x00null":                "control",
+		"data-\ufdd0":                  "nonchar",
+		"data-\xff":                    "invalid-utf8",
+	}, Text("hello"))
+	assert.Equal(t,
+		`<div id="safe" data-invalid-attr data-invalid-attr-data-_ data-invalid-attr-data-_null data-invalid-attr-data-x___script_ data-invalid-attr-data-x_onload_foo data-invalid-attr-onclick_alert_1__x>hello</div>`,
+		el.Render(),
+	)
+
+	// Single invalid attribute (exercises len(e.Attrs) == 1 fast path)
+	single := Input(attrs.Props{"onclick=alert(1) x": "space"})
+	assert.Equal(t, `<input data-invalid-attr-onclick_alert_1__x>`, single.Render())
+
+	// Single empty attribute (exercises len(e.Attrs) == 1 fast path)
+	singleEmpty := Input(attrs.Props{"": "empty"})
+	assert.Equal(t, `<input data-invalid-attr>`, singleEmpty.Render())
+
+	// Distinct invalid names that sanitize to the same placeholder are deduplicated
+	dedup := Div(attrs.Props{"a b": "1", "a=b": "2"})
+	assert.Equal(t, `<div data-invalid-attr-a_b></div>`, dedup.Render())
+
+	// Placeholder colliding with an existing valid attribute is not duplicated
+	collision := Div(attrs.Props{
+		"bad attr":                   "dropped",
+		"data-invalid-attr-bad_attr": "real",
+	})
+	assert.Equal(t, `<div data-invalid-attr-bad_attr="real"></div>`, collision.Render())
+}
+
+func TestInvalidAttrNamePanic(t *testing.T) {
+	opts := RenderOptions{InvalidAttrMode: InvalidNamePanic}
+
+	// Single invalid attribute (exercises len(e.Attrs) == 1 fast path)
+	single := Div(attrs.Props{"onclick=alert(1) x": "space"}, Text("hello"))
+	assert.PanicsWithValue(t, `invalid attribute name "onclick=alert(1) x"`, func() {
+		single.RenderWithOptions(opts)
+	})
+
+	// Multiple attributes (exercises sorted-keys path)
+	multi := Div(attrs.Props{
+		attrs.ID:                      "safe",
+		attrs.DataAttr(`x"><script>`): "tag-breakout",
+	}, Text("hello"))
+	assert.PanicsWithValue(t, `invalid attribute name "data-x\"><script>"`, func() {
+		multi.RenderWithOptions(opts)
+	})
+}
+
+func TestInvalidAttrNameAsIs(t *testing.T) {
+	opts := RenderOptions{InvalidAttrMode: InvalidNameAsIs}
+
+	// Single invalid attribute (exercises len(e.Attrs) == 1 fast path)
+	single := Input(attrs.Props{"bad attr": `a"b`})
+	assert.Equal(t, `<input bad attr="a&quot;b">`, single.RenderWithOptions(opts))
+
+	// Multiple attributes (exercises sorted-keys path)
+	multi := Div(attrs.Props{
+		attrs.ID:   "safe",
+		"bad attr": "val",
+	}, Text("hello"))
+	assert.Equal(t, `<div bad attr="val" id="safe">hello</div>`, multi.RenderWithOptions(opts))
+}
+
+func TestInvalidTagNamePlaceholder(t *testing.T) {
+	cases := []struct {
+		tag      string
+		expected string
+	}{
+		{tag: "", expected: "<!-- empty tag -->"},
+		{tag: "div onclick=alert(1)", expected: "<!-- invalid tag: div_onclick_alert_1_ -->"},
+		{tag: "div><script>alert(1)</script><div", expected: "<!-- invalid tag: div__script_alert_1___script__div -->"},
+		{tag: "1invalid", expected: "<!-- invalid tag: 1invalid -->"},
+		{tag: "div-->", expected: "<!-- invalid tag: div--_ -->"},
+		{tag: "div-名前", expected: "<!-- invalid tag: div-__ -->"},
+	}
+	for _, tc := range cases {
+		el := &Element{Tag: tc.tag, Children: []Node{Text("hi")}}
+		assert.Equal(t, tc.expected, el.Render())
+	}
+
+	parent := Div(nil,
+		&Element{Tag: "div><script>alert(1)</script>", Children: []Node{Text("dropped")}},
+		P(nil, Text("kept")),
+	)
+	assert.Equal(t, `<div><!-- invalid tag: div__script_alert_1___script_ --><p>kept</p></div>`, parent.Render())
+}
+
+func TestInvalidTagNamePanic(t *testing.T) {
+	opts := RenderOptions{InvalidTagMode: InvalidNamePanic}
+	cases := []struct {
+		tag      string
+		expected string
+	}{
+		{tag: "", expected: `invalid tag name ""`},
+		{tag: "div onclick=alert(1)", expected: `invalid tag name "div onclick=alert(1)"`},
+		{tag: "div><script>alert(1)</script><div", expected: `invalid tag name "div><script>alert(1)</script><div"`},
+		{tag: "1invalid", expected: `invalid tag name "1invalid"`},
+	}
+	for _, tc := range cases {
+		el := &Element{Tag: tc.tag, Children: []Node{Text("hi")}}
+		assert.PanicsWithValue(t, tc.expected, func() {
+			el.RenderWithOptions(opts)
+		})
+	}
+}
+
+func TestInvalidTagNameAsIs(t *testing.T) {
+	opts := RenderOptions{InvalidTagMode: InvalidNameAsIs}
+	cases := []struct {
+		tag      string
+		expected string
+	}{
+		{tag: "", expected: "<>hi</>"},
+		{tag: "ns:widget", expected: "<ns:widget>hi</ns:widget>"},
+		{tag: "1invalid", expected: "<1invalid>hi</1invalid>"},
+	}
+	for _, tc := range cases {
+		el := &Element{Tag: tc.tag, Children: []Node{Text("hi")}}
+		assert.Equal(t, tc.expected, el.RenderWithOptions(opts))
+	}
+
+	// StyleManager still injects CSS when InvalidTagMode is InvalidNameAsIs.
+	styled := &Element{Tag: "ns:html", Children: []Node{Body(nil, Text("hi"))}}
+	assert.Equal(t,
+		"<ns:html><head><style>body { background-color: #fff; }</style></head><body>hi</body></ns:html>",
+		styled.RenderWithOptions(RenderOptions{
+			InvalidTagMode: InvalidNameAsIs,
+			StyleManager:   &MockStyleManager{},
+		}),
+	)
+}
+
+func TestIndependentInvalidTagAndAttrModes(t *testing.T) {
+	both := Div(attrs.Props{attrs.ID: "root", "bad attr": "x"},
+		&Element{Tag: "bad>tag", Children: []Node{Text("dropped")}},
+		P(nil, Text("kept")),
+	)
+
+	// Default renders placeholders for both invalid tags and invalid attributes.
+	assert.Equal(t,
+		`<div id="root" data-invalid-attr-bad_attr><!-- invalid tag: bad_tag --><p>kept</p></div>`,
+		both.Render(),
+	)
+
+	// Panic on invalid tags still emits placeholders for invalid attrs when tags are valid.
+	badAttrOnly := Div(attrs.Props{attrs.ID: "root", "bad attr": "x"}, P(nil, Text("kept")))
+	assert.Equal(t,
+		`<div id="root" data-invalid-attr-bad_attr><p>kept</p></div>`,
+		badAttrOnly.RenderWithOptions(RenderOptions{InvalidTagMode: InvalidNamePanic}),
+	)
+	assert.Panics(t, func() {
+		both.RenderWithOptions(RenderOptions{InvalidTagMode: InvalidNamePanic})
+	})
+
+	// Panic on invalid attrs still emits placeholders for invalid tags when attrs are valid.
+	badTagOnly := Div(attrs.Props{attrs.ID: "root"},
+		&Element{Tag: "bad>tag", Children: []Node{Text("dropped")}},
+		P(nil, Text("kept")),
+	)
+	assert.Equal(t,
+		`<div id="root"><!-- invalid tag: bad_tag --><p>kept</p></div>`,
+		badTagOnly.RenderWithOptions(RenderOptions{InvalidAttrMode: InvalidNamePanic}),
+	)
+	assert.Panics(t, func() {
+		both.RenderWithOptions(RenderOptions{InvalidAttrMode: InvalidNamePanic})
+	})
+
+	// As-is on invalid tags still emits placeholders for invalid attrs, and vice versa.
+	assert.Equal(t,
+		`<div id="root" data-invalid-attr-bad_attr><bad>tag>dropped</bad>tag><p>kept</p></div>`,
+		both.RenderWithOptions(RenderOptions{InvalidTagMode: InvalidNameAsIs}),
+	)
+	assert.Equal(t,
+		`<div bad attr="x" id="root"><!-- invalid tag: bad_tag --><p>kept</p></div>`,
+		both.RenderWithOptions(RenderOptions{InvalidAttrMode: InvalidNameAsIs}),
+	)
+}
+
+func TestCustomElementTagAllowed(t *testing.T) {
+	el := &Element{
+		Tag:      "my-widget_1",
+		Attrs:    attrs.Props{attrs.ID: "w1", "hx-on:click": "doSomething()"},
+		Children: []Node{Text("ok")},
+	}
+	assert.Equal(t, `<my-widget_1 hx-on:click="doSomething()" id="w1">ok</my-widget_1>`, el.Render())
+}
+
+func TestFragmentIgnoresAttrs(t *testing.T) {
+	frag := &Element{
+		Tag:      "fragment",
+		Attrs:    attrs.Props{attrs.ID: "ignored", "bad attr": "ignored"},
+		Children: []Node{P(nil, Text("1")), P(nil, Text("2"))},
+	}
+	assert.Equal(t, `<p>1</p><p>2</p>`, frag.Render())
+}
+
 func TestFragment(t *testing.T) {
 	expected := `<div><p>0</p><p>1</p><p>2</p><p>3</p><p>4</p></div>`
 	nodes1 := []Node{

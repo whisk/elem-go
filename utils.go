@@ -3,6 +3,7 @@ package elem
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // nodeContentReplacer handles escaping of HTML special characters in text nodes
@@ -92,6 +93,114 @@ func EscapeCommentContents(s string) string {
 	}
 
 	return s
+}
+
+// invalidASCIIAttrNameChar marks ASCII bytes disallowed in HTML5 attribute names:
+// controls (0x00-0x1F, 0x7F), space (0x20), '"', '\”, '/', '<', '=', '>'.
+var invalidASCIIAttrNameChar = [128]bool{
+	0x00: true, 0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x05: true, 0x06: true, 0x07: true,
+	0x08: true, 0x09: true, 0x0A: true, 0x0B: true, 0x0C: true, 0x0D: true, 0x0E: true, 0x0F: true,
+	0x10: true, 0x11: true, 0x12: true, 0x13: true, 0x14: true, 0x15: true, 0x16: true, 0x17: true,
+	0x18: true, 0x19: true, 0x1A: true, 0x1B: true, 0x1C: true, 0x1D: true, 0x1E: true, 0x1F: true,
+	' ':  true,
+	'"':  true,
+	'\'': true,
+	'/':  true,
+	'<':  true,
+	'=':  true,
+	'>':  true,
+	0x7F: true,
+}
+
+// validAttrName reports whether name is a valid HTML5 attribute name according to
+// https://html.spec.whatwg.org/multipage/syntax.html#attributes-2 (also rejecting '<'
+// and invalid UTF-8 sequences).
+func validAttrName(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b < 0x80 {
+			if invalidASCIIAttrNameChar[b] {
+				return false
+			}
+			continue
+		}
+		if !utf8.ValidString(name[i:]) {
+			return false
+		}
+		for _, r := range name[i:] {
+			if r < 0x80 {
+				if invalidASCIIAttrNameChar[r] {
+					return false
+				}
+				continue
+			}
+			// Reject C1 controls (U+0080..U+009F) and Unicode noncharacters
+			// (U+FDD0..U+FDEF, and U+nFFFE/U+nFFFF on every plane).
+			if r <= 0x9F || (r >= 0xFDD0 && r <= 0xFDEF) || (r&0xFFFE) == 0xFFFE {
+				return false
+			}
+		}
+		return true
+	}
+	return true
+}
+
+// validTagName reports whether tag is a valid HTML tag name:
+// an ASCII letter followed by zero or more ASCII letters, digits, hyphens, or underscores.
+// Underscores are allowed because the WHATWG custom element name grammar (PCENChar) permits them.
+func validTagName(tag string) bool {
+	if len(tag) == 0 {
+		return false
+	}
+	c := tag[0]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(tag); i++ {
+		c = tag[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// writeSanitizedName writes name to builder with every rune outside
+// [a-zA-Z0-9-_] replaced by '_'.
+func writeSanitizedName(builder *strings.Builder, name string) {
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			builder.WriteByte(byte(r))
+		} else {
+			builder.WriteByte('_')
+		}
+	}
+}
+
+// writeInvalidAttrPlaceholder writes the safe placeholder attribute name for an
+// invalid attribute name into builder: invalidAttrPlaceholder for an empty name,
+// or invalidAttrPlaceholder + "-" + sanitized name otherwise.
+func writeInvalidAttrPlaceholder(builder *strings.Builder, attrName string) {
+	builder.WriteString(invalidAttrPlaceholder)
+	if attrName != "" {
+		builder.WriteByte('-')
+		writeSanitizedName(builder, attrName)
+	}
+}
+
+// invalidAttrName returns the safe placeholder attribute name for an invalid
+// attribute name.
+func invalidAttrName(attrName string) string {
+	if attrName == "" {
+		return invalidAttrPlaceholder
+	}
+	var b strings.Builder
+	b.Grow(len(invalidAttrPlaceholder) + 1 + len(attrName))
+	writeInvalidAttrPlaceholder(&b, attrName)
+	return b.String()
 }
 
 // scriptContentsRegexp matches <script and </script case-insensitively

@@ -9,6 +9,7 @@
 - Type-safe constructors for nearly every standard HTML5 element and attribute.
 - Utilities like `If` and `TransformEach` for conditional and list rendering.
 - Automatic HTML escaping of text content and attribute values (use `Raw` to opt out of text escaping).
+- Custom elements and attributes with validation.
 - Zero runtime dependencies.
 - Inline CSS styling with the [styles](styles/README.md) subpackage.
 - Advanced CSS features (pseudo-classes, animations, media queries) with [`StyleManager`](styles/STYLEMANAGER.md).
@@ -187,7 +188,7 @@ rawHTML := `<div class="custom-html"><p>Custom HTML content</p></div>`
 content := elem.Div(nil,
     elem.H1(nil, elem.Text("Welcome to Elem-Go")),
     elem.Raw(rawHTML), // Inserting the raw HTML
-    elem.P(nil, elem.Text("More content here...")), 
+    elem.P(nil, elem.Text("More content here...")),
 )
 
 htmlOutput := content.Render()
@@ -269,6 +270,38 @@ content := elem.Div(attrs.Props{
 })
 // Renders: <div data='{"name": "Joe&#39;s BBQ"}'></div>
 ```
+
+### Tag and Attribute Name Validation
+
+Custom elements and attributes are validated during rendering to prevent code injection.
+
+Valid element names must start with an ASCII letter and contain only ASCII letters, digits, hyphens, or underscores. Attribute names mustfollow the [HTML attribute name rules](https://html.spec.whatwg.org/multipage/syntax.html#attributes-2).
+
+By default, invalid names are replaced with no-op placeholders:
+
+```go
+el := elem.Div(attrs.Props{
+    attrs.ID:   "card",
+    "bad attr": "x",
+}, &elem.Element{Tag: "bad>tag", Children: []elem.Node{elem.Text("hi")}})
+
+el.Render()
+// Renders: <div id="card" data-invalid-attr-bad_attr><!-- invalid tag: bad_tag --></div>
+```
+
+Invalid tag contents are not rendered.
+
+To fail fast instead, set `InvalidTagMode` and/or `InvalidAttrMode` in `RenderOptions` to `elem.InvalidNamePanic`:
+
+```go
+html := el.RenderWithOptions(elem.RenderOptions{
+    InvalidTagMode:  elem.InvalidNamePanic,
+    InvalidAttrMode: elem.InvalidNamePanic,
+})
+// Panics with: "invalid tag name: bad>tag"
+```
+
+A deprecated `elem.InvalidNameAsIs` mode is also provided for backwards compatibility to render names as-is without any validation, though it is highy insecure, not recommended, and may be removed in future versions.
 
 ## Advanced CSS Styling with `StyleManager`
 
